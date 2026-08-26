@@ -21,8 +21,8 @@ import java.util.List;
  * <ul>
  *   <li>{@link FormattedViewTranslator} - messages grouped by source language, one batched
  *       Systran call per group.</li>
- *   <li>{@link SimpleViewTranslator} - one payload blob per request, chained sequentially
- *       through each detected language.</li>
+ *   <li>{@link SimpleViewTranslator} - one payload blob per request, translated once
+ *       per detected language.</li>
  * </ul>
  *
  * <p>The guard order is now identical for both views. Previously the formatted view checked
@@ -56,7 +56,7 @@ public class TranslationService {
         return formattedViewTranslator.translate(messages, target);
     }
 
-    /** Simple View: translates each payload blob, chaining through its detected languages. */
+    /** Simple View: translates each payload blob once per language it contains. */
     public List<TranslateSimpleRequest> translateSimpleView(List<TranslateSimpleRequest> requests,
                                                             String target) {
         if (CollectionUtils.isEmpty(requests)) {

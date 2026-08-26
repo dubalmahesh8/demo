@@ -26,7 +26,7 @@ public enum MessageTranslationStatus {
     SKIPPED_UNSUPPORTED_SOURCE(false, false),
 
     /**
-     * Simple view only. Some hops in the chain completed and some failed upstream, so the
+     * Simple view only. Some source languages were translated and others failed upstream, so the
      * text is translated but not fully. Both translated and retryable: the caller has usable
      * content now, and a retry would complete it.
      */
