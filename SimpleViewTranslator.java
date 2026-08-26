@@ -186,8 +186,25 @@ public class SimpleViewTranslator {
         List<String> unsupported = new ArrayList<>(plan.unsupported());
         SystranOutcome.Translated lastTranslated = null;
 
+        TranslationException hopFailure = null;
+
         for (Hop hop : plan.hops()) {
-            SystranOutcome outcome = systranGateway.translate(text, hop.systranCode(), target);
+            SystranOutcome outcome;
+            try {
+                outcome = systranGateway.translate(text, hop.systranCode(), target);
+            } catch (TranslationException ex) {
+                if (lastTranslated == null) {
+                    // Nothing salvaged yet - let the blob fail cleanly and keep the original.
+                    throw ex;
+                }
+                // Earlier hops already produced usable text. Discarding it because a later
+                // hop failed would throw away completed work and, for a single-blob request,
+                // turn a partial success into a 502.
+                log.warn("Hop '{}' -> '{}' failed after {} successful hop(s); keeping partial result.",
+                        hop.systranCode(), target, plan.hops().indexOf(hop), ex);
+                hopFailure = ex;
+                break;
+            }
 
             if (outcome instanceof SystranOutcome.SourceRejected rejected) {
                 // Systran advertised this pair but declined it. Record and keep going -
@@ -213,7 +230,16 @@ public class SimpleViewTranslator {
         }
 
         request.setMessage(text);
-        apply(request, MessageTranslationStatus.TRANSLATED, null);
+
+        if (hopFailure != null) {
+            TranslationErrorCode code = hopFailure.getErrorCode();
+            apply(request, MessageTranslationStatus.PARTIALLY_TRANSLATED,
+                    "Some source languages were translated; the rest failed upstream"
+                            + (code == null ? "" : " (" + code.name() + ")")
+                            + ". Retry to complete.");
+        } else {
+            apply(request, MessageTranslationStatus.TRANSLATED, null);
+        }
 
         // Only echo Systran's own detection back when we actually fell through to auto.
         if (plan.usedAuto() && StringUtils.isNotBlank(lastTranslated.detectedSource())) {
