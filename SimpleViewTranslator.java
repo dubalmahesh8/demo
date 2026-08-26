@@ -23,33 +23,13 @@ import java.util.Map;
 import java.util.Optional;
 
 /**
- * Simple View: each request carries one payload blob that may contain several languages, so
- * the blob is chained sequentially through each detected source language.
+ * Simple View: one payload blob per request. A blob holds a whole conversation and can mix
+ * several languages, so it is translated once per language it contains, each pass working on
+ * the text the previous pass produced.
  *
- * <h2>Flow</h2>
- * <pre>
- *   translate(requests, target)
- *     |
- *     +-- for each blob: translateBlob
- *     |     |
- *     |     +-- STEP 1  plan     which languages to chain through, in which order,
- *     |     |                    using the codes Systran actually accepts
- *     |     |
- *     |     +-- STEP 2  chain    one call per hop, each feeding the next
- *     |
- *     +-- STEP 3  failIfNothingSucceeded   502/504 only when every blob failed outright
- * </pre>
- *
- * <h2>How this differs from the formatted view</h2>
- * <ul>
- *   <li><b>Unit of work is the blob, not a language group.</b> One blob can make several calls.</li>
- *   <li><b>A blob can end up partially translated.</b> If hop 3 of 5 fails, hops 1-2 already
- *       rewrote the text. Discarding that would throw away completed work, so the blob keeps it
- *       and reports {@code PARTIALLY_TRANSLATED} — translated <em>and</em> retryable.</li>
- *   <li><b>A partial blob does not count as failed</b> for the batch verdict. Only a blob that
- *       salvaged nothing does. This is why a single blob whose second hop fails returns 200
- *       rather than 502.</li>
- * </ul>
+ * <p>Unlike the formatted view a blob can end up partially translated, and a partially
+ * translated blob does not count as a failure - which is why a single blob whose second pass
+ * fails returns 200, not 502.
  */
 @Slf4j
 @Component
@@ -62,309 +42,260 @@ public class SimpleViewTranslator {
     public List<TranslateSimpleRequest> translate(List<TranslateSimpleRequest> requests, String target) {
         String normalizedTarget = LanguageCodes.normalize(target);
 
-        BatchOutcome outcome = new BatchOutcome();
-        for (TranslateSimpleRequest request : requests) {
-            translateBlob(request, normalizedTarget, outcome);
-        }
+        RequestTally tally = new RequestTally();
+        requests.forEach(request -> translateBlob(request, normalizedTarget, tally));
 
-        // STEP 3 - Decide whether the request as a whole succeeded.
-        outcome.failIfNothingSucceeded();
-        outcome.logSummary(normalizedTarget, requests.size());
-
+        tally.failIfNothingSucceeded();
+        tally.logSummary(normalizedTarget, requests.size());
         return requests;
     }
 
-    /** One blob, start to finish. Never throws unless the blob salvaged nothing. */
-    private void translateBlob(TranslateSimpleRequest request, String target, BatchOutcome outcome) {
+    private void translateBlob(TranslateSimpleRequest request, String target, RequestTally tally) {
+        TranslationPlan plan = planLanguages(request, target);
 
-        // STEP 1 - Work out what, if anything, to send.
-        Plan plan = plan(request, target);
-
-        if (plan.isTerminal()) {
-            // Decided without calling Systran. Not attempted, so it cannot fail the batch.
-            if (!plan.unsupported().isEmpty()) {
-                request.setNotSupportedLanguages(plan.unsupported());
+        // Decided without calling Systran, so it cannot fail the request.
+        if (plan.nothingToTranslate()) {
+            if (!plan.unsupportedLanguages().isEmpty()) {
+                request.setNotSupportedLanguages(plan.unsupportedLanguages());
             }
-            apply(request, plan.terminalStatus(), plan.reason());
+            recordStatus(request, plan.skipStatus(), plan.skipReason());
             return;
         }
 
-        // STEP 2 - Run the chain.
         try {
-            ChainVerdict verdict = chain(request, plan, target);
-            outcome.recordAttempt(verdict);
+            tally.recordAttempt(translateEachLanguage(request, plan, target));
         } catch (TranslationException ex) {
-            // Only reaches here when the very first hop failed - nothing was salvaged.
+            // Only reachable when the first language failed - nothing was salvaged.
             markFailed(request, ex);
-            outcome.recordTotalFailure(ex);
+            tally.recordOutrightFailure(ex);
         }
     }
 
-    // ============================================================ STEP 1: plan the chain
+    // ---------------------------------------------------------------- deciding what to translate
 
-    /** One chain step: the code Systran gets, and the code the caller gave us. */
-    private record Hop(String systranCode, String declaredCode) {
-    }
-
-    /**
-     * Either a list of hops to run, or a terminal status explaining why there are none.
-     * {@code terminalStatus} is non-null exactly when {@code hops} is empty.
-     */
-    private record Plan(List<Hop> hops,
-                        List<String> unsupported,
-                        boolean usedAuto,
-                        MessageTranslationStatus terminalStatus,
-                        String reason) {
-
-        boolean isTerminal() {
-            return hops.isEmpty();
-        }
-
-        static Plan skip(MessageTranslationStatus status, String reason) {
-            return new Plan(List.of(), List.of(), false, status, reason);
-        }
-
-        static Plan skip(MessageTranslationStatus status, String reason, List<String> unsupported) {
-            return new Plan(List.of(), unsupported, false, status, reason);
-        }
-
-        static Plan of(List<Hop> hops, List<String> unsupported, boolean usedAuto) {
-            return new Plan(hops, unsupported, usedAuto, null, null);
-        }
+    /** A language to translate from: the code Systran accepts, and the code the caller sent. */
+    private record SourceLanguage(String systranCode, String callerCode) {
     }
 
     /**
-     * Decides which source languages this blob should be chained through.
-     *
-     * <p>Checks run cheapest-first:
-     * <ol>
-     *   <li>no translatable content - nothing to send</li>
-     *   <li>no languages supplied - fall through to Systran's own detection</li>
-     *   <li>otherwise resolve each supplied language, dropping target-language and
-     *       unsupported entries</li>
-     * </ol>
+     * Which languages this blob needs translating from, or why none of them do.
+     * {@code skipStatus} is non-null exactly when {@code sourceLanguages} is empty.
      */
-    private Plan plan(TranslateSimpleRequest request, String target) {
+    private record TranslationPlan(List<SourceLanguage> sourceLanguages,
+                                   List<String> unsupportedLanguages,
+                                   boolean letSystranDetect,
+                                   MessageTranslationStatus skipStatus,
+                                   String skipReason) {
 
-        // 1.1 - Nothing to translate: blank, or markup and punctuation only.
+        boolean nothingToTranslate() {
+            return sourceLanguages.isEmpty();
+        }
+
+        static TranslationPlan skip(MessageTranslationStatus status, String reason) {
+            return new TranslationPlan(List.of(), List.of(), false, status, reason);
+        }
+
+        static TranslationPlan skip(MessageTranslationStatus status, String reason,
+                                    List<String> unsupported) {
+            return new TranslationPlan(List.of(), unsupported, false, status, reason);
+        }
+
+        static TranslationPlan translateFrom(List<SourceLanguage> languages,
+                                             List<String> unsupported, boolean letSystranDetect) {
+            return new TranslationPlan(languages, unsupported, letSystranDetect, null, null);
+        }
+    }
+
+    private TranslationPlan planLanguages(TranslateSimpleRequest request, String target) {
         if (StringUtils.isBlank(request.getMessage())
                 || !hasTranslatableContent(request.getMessage())) {
-            return Plan.skip(MessageTranslationStatus.SKIPPED_NO_TRANSLATABLE_CONTENT,
+            return TranslationPlan.skip(MessageTranslationStatus.SKIPPED_NO_TRANSLATABLE_CONTENT,
                     "Payload contains no translatable text.");
         }
 
-        // 1.2 - No hint from the caller: a single auto hop, and we echo the detection back later.
+        // No languages from the caller: ask Systran to detect, and echo its answer back afterwards.
         if (CollectionUtils.isEmpty(request.getDetectedLanguages())) {
-            return Plan.of(List.of(new Hop(LanguageCodes.AUTO, LanguageCodes.AUTO)), List.of(), true);
+            return TranslationPlan.translateFrom(
+                    List.of(new SourceLanguage(LanguageCodes.AUTO, LanguageCodes.AUTO)), List.of(), true);
         }
 
-        // 1.3 - Resolve each supplied language. Keyed by resolved code so zh-Hans and zh
-        // collapse to one hop instead of translating the same content twice.
-        Map<String, Hop> hops = new LinkedHashMap<>();
+        // Keyed by the Systran code so zh-Hans and zh collapse into one pass instead of two.
+        Map<String, SourceLanguage> toTranslate = new LinkedHashMap<>();
         List<String> unsupported = new ArrayList<>();
         boolean sawTargetLanguage = false;
 
-        for (String raw : new LinkedHashSet<>(request.getDetectedLanguages())) {
-            if (StringUtils.isBlank(raw)) {
+        for (String rawCode : new LinkedHashSet<>(request.getDetectedLanguages())) {
+            if (StringUtils.isBlank(rawCode)) {
                 continue;
             }
-            String declared = LanguageCodes.normalize(raw);
+            String callerCode = LanguageCodes.normalize(rawCode);
 
-            // 1.3a - Already the target language: no hop needed.
-            if (LanguageCodes.sameLanguage(declared, target)) {
+            if (LanguageCodes.sameLanguage(callerCode, target)) {
                 sawTargetLanguage = true;
                 continue;
             }
 
-            // 1.3b - Unsupported pair: record it, skip the call.
-            Optional<String> resolved = supportedLanguagePolicy.resolveSource(declared, target);
-            if (resolved.isEmpty()) {
-                unsupported.add(declared);
+            Optional<String> systranCode = supportedLanguagePolicy.resolveSource(callerCode, target);
+            if (systranCode.isEmpty()) {
+                unsupported.add(callerCode);
                 log.info("Skipping unsupported source '{}' -> target '{}' (original retained).",
-                        declared, target);
+                        callerCode, target);
                 continue;
             }
-
-            hops.putIfAbsent(resolved.get(), new Hop(resolved.get(), declared));
+            toTranslate.putIfAbsent(systranCode.get(), new SourceLanguage(systranCode.get(), callerCode));
         }
 
-        if (!hops.isEmpty()) {
-            return Plan.of(List.copyOf(hops.values()), unsupported, false);
+        if (!toTranslate.isEmpty()) {
+            return TranslationPlan.translateFrom(List.copyOf(toTranslate.values()), unsupported, false);
         }
 
-        // 1.4 - No hops left. Distinguish why, so the caller knows whether the content was
-        // already fine or genuinely could not be handled.
+        // Nothing left. Distinguish "already fine" from "we cannot handle these languages".
         if (!unsupported.isEmpty()) {
-            return Plan.skip(MessageTranslationStatus.SKIPPED_UNSUPPORTED_SOURCE,
-                    "No detected source language is supported for target '" + target + "'.",
-                    unsupported);
+            return TranslationPlan.skip(MessageTranslationStatus.SKIPPED_UNSUPPORTED_SOURCE,
+                    "No detected source language is supported for target '" + target + "'.", unsupported);
         }
-        return Plan.skip(
-                sawTargetLanguage
-                        ? MessageTranslationStatus.SKIPPED_ALREADY_TARGET_LANGUAGE
+        return TranslationPlan.skip(
+                sawTargetLanguage ? MessageTranslationStatus.SKIPPED_ALREADY_TARGET_LANGUAGE
                         : MessageTranslationStatus.SKIPPED_NO_TRANSLATABLE_CONTENT,
-                sawTargetLanguage
-                        ? "Payload is already in the target language."
+                sawTargetLanguage ? "Payload is already in the target language."
                         : "No usable source language was detected.");
     }
 
     private boolean hasTranslatableContent(String html) {
-        String plain = Jsoup.parse(html).text(); // drops tags
-        return plain.codePoints().anyMatch(Character::isLetter);
+        return Jsoup.parse(html).text().codePoints().anyMatch(Character::isLetter);
     }
 
-    // ============================================================ STEP 2: run the chain
+    // ---------------------------------------------------------------- doing the translation
 
-    /** How a blob's chain ended. All three are non-failures for the batch verdict. */
-    private enum ChainVerdict {
-        /** Every hop that ran produced a translation. */
-        COMPLETE,
-        /** Some hops succeeded, then one failed upstream. Partial text kept. */
-        PARTIAL,
-        /** Systran declined every hop with a 406. Original text kept. */
-        ALL_REJECTED
+    /** How far a blob got. All three are non-failures as far as the HTTP status is concerned. */
+    private enum BlobResult {
+        FULLY_TRANSLATED, PARTIALLY_TRANSLATED, NONE_ACCEPTED
     }
 
     /**
-     * Runs the blob through each hop in turn, feeding each result into the next call.
+     * Translates the blob once per source language, each pass working on the text the previous
+     * pass produced. The request is only updated once every pass has finished, so a failure on
+     * the first pass leaves the caller's original text untouched.
      *
-     * <p>The request is only mutated once the chain has settled, so a first-hop failure leaves
-     * the caller's original text untouched.
-     *
-     * @throws TranslationException only if the <em>first</em> hop fails; once any hop has
-     *         succeeded, a later failure downgrades to {@link ChainVerdict#PARTIAL}
+     * @throws TranslationException only if the FIRST pass fails; translateBlob's catch relies on this
      */
-    private ChainVerdict chain(TranslateSimpleRequest request, Plan plan, String target) {
+    private BlobResult translateEachLanguage(TranslateSimpleRequest request, TranslationPlan plan,
+                                             String target) {
         String text = request.getMessage();
-        List<String> unsupported = new ArrayList<>(plan.unsupported());
-        SystranOutcome.Translated lastTranslated = null;
-        TranslationException hopFailure = null;
+        List<String> unsupported = new ArrayList<>(plan.unsupportedLanguages());
+        SystranOutcome.Translated lastSuccess = null;
+        TranslationException failureAfterSuccess = null;
 
-        for (Hop hop : plan.hops()) {
-
-            // 2.1 - One call per hop, on the text produced by the previous hop.
+        for (SourceLanguage source : plan.sourceLanguages()) {
             SystranOutcome outcome;
             try {
-                outcome = systranGateway.translate(text, hop.systranCode(), target);
+                outcome = systranGateway.translate(text, source.systranCode(), target);
             } catch (TranslationException ex) {
-                if (lastTranslated == null) {
-                    // 2.2 - Nothing salvaged yet. Let the blob fail and keep the original.
+                if (lastSuccess == null) {
                     throw ex;
                 }
-                // 2.3 - Earlier hops already produced usable text. Keeping it beats discarding
-                // completed work and turning a partial success into a 502.
-                log.warn("Hop '{}' -> '{}' failed after an earlier hop succeeded; keeping partial result.",
-                        hop.systranCode(), target, ex);
-                hopFailure = ex;
+                // An earlier language already translated part of the blob; keeping that beats
+                // throwing away finished work.
+                log.warn("Translating from '{}' to '{}' failed after an earlier language succeeded; "
+                        + "keeping the partial result.", source.systranCode(), target, ex);
+                failureAfterSuccess = ex;
                 break;
             }
 
-            // 2.4 - Systran declined this pair. Permanent, so record it and try the next language.
+            // A 406 rules out this language only - record it and move to the next one.
             if (outcome instanceof SystranOutcome.SourceRejected rejected) {
-                log.info("{} Continuing with remaining source(s).", rejected.detail());
-                unsupported.add(hop.declaredCode());
+                log.info("{} Continuing with the remaining language(s).", rejected.detail());
+                unsupported.add(source.callerCode());
                 continue;
             }
 
-            lastTranslated = (SystranOutcome.Translated) outcome;
-            text = lastTranslated.text();
+            lastSuccess = (SystranOutcome.Translated) outcome;
+            text = lastSuccess.text();
         }
 
-        // 2.5 - Settle the blob. One write point, one verdict.
         if (!unsupported.isEmpty()) {
             request.setNotSupportedLanguages(unsupported);
         }
 
-        if (lastTranslated == null) {
-            apply(request, MessageTranslationStatus.SKIPPED_UNSUPPORTED_SOURCE,
+        if (lastSuccess == null) {
+            recordStatus(request, MessageTranslationStatus.SKIPPED_UNSUPPORTED_SOURCE,
                     "Systran rejected every detected source language for target '" + target + "'.");
-            return ChainVerdict.ALL_REJECTED;
+            return BlobResult.NONE_ACCEPTED;
         }
 
         request.setMessage(text);
 
-        if (hopFailure != null) {
-            TranslationErrorCode code = hopFailure.getErrorCode();
-            apply(request, MessageTranslationStatus.PARTIALLY_TRANSLATED,
+        if (failureAfterSuccess != null) {
+            TranslationErrorCode code = failureAfterSuccess.getErrorCode();
+            recordStatus(request, MessageTranslationStatus.PARTIALLY_TRANSLATED,
                     "Some source languages were translated; the rest failed upstream"
-                            + (code == null ? "" : " (" + code.name() + ")")
-                            + ". Retry to complete.");
-            return ChainVerdict.PARTIAL;
+                            + (code == null ? "" : " (" + code.name() + ")") + ". Retry to complete.");
+            return BlobResult.PARTIALLY_TRANSLATED;
         }
 
-        apply(request, MessageTranslationStatus.TRANSLATED, null);
+        recordStatus(request, MessageTranslationStatus.TRANSLATED, null);
 
-        // 2.6 - Echo Systran's own detection back only when we actually fell through to auto.
-        if (plan.usedAuto() && StringUtils.isNotBlank(lastTranslated.detectedSource())) {
-            request.setDetectedLanguages(List.of(lastTranslated.detectedSource()));
+        // Echo Systran's detection back only when we actually asked it to detect.
+        if (plan.letSystranDetect() && StringUtils.isNotBlank(lastSuccess.detectedSource())) {
+            request.setDetectedLanguages(List.of(lastSuccess.detectedSource()));
         }
-        return ChainVerdict.COMPLETE;
+        return BlobResult.FULLY_TRANSLATED;
     }
 
-    // ============================================================ STEP 3: batch verdict
+    // ---------------------------------------------------------------- deciding the HTTP status
 
-    /**
-     * Tally across blobs, and the rule for turning it into an HTTP outcome.
-     *
-     * <p>The rule differs from the formatted view in one place: a {@link ChainVerdict#PARTIAL}
-     * blob counts as an attempt that produced value, so it does <em>not</em> push the batch
-     * toward a 502. Only a blob that salvaged nothing counts as failed.
-     */
-    private static final class BatchOutcome {
+    /** Running count across the blobs in one request, and the rule for turning it into a status. */
+    private static final class RequestTally {
 
         private int attempted;
-        private int failed;
+        private int failedOutright;
         private int partial;
         private TranslationException lastFailure;
 
-        void recordAttempt(ChainVerdict verdict) {
+        void recordAttempt(BlobResult result) {
             attempted++;
-            if (verdict == ChainVerdict.PARTIAL) {
+            if (result == BlobResult.PARTIALLY_TRANSLATED) {
                 partial++;
             }
         }
 
-        void recordTotalFailure(TranslationException ex) {
+        void recordOutrightFailure(TranslationException ex) {
             attempted++;
-            failed++;
+            failedOutright++;
             lastFailure = ex;
         }
 
-        /**
-         * Propagates only when every blob we tried failed outright. Returning 200 in that case
-         * would tell the caller the content is untranslatable, when in fact Systran is unwell.
-         *
-         * <p>Note {@code attempted > 0}: a request where every blob was skipped attempted
-         * nothing, so nothing failed, and 200 is the honest answer.
-         */
+        /** 200 would claim the content is untranslatable when really Systran is unwell. */
         void failIfNothingSucceeded() {
-            if (attempted > 0 && failed == attempted) {
+            // attempted > 0: a request where every blob was skipped tried nothing, so nothing failed.
+            if (attempted > 0 && failedOutright == attempted) {
                 throw lastFailure;
             }
         }
 
         void logSummary(String target, int blobCount) {
-            if (failed > 0 || partial > 0) {
+            if (failedOutright > 0 || partial > 0) {
                 log.warn("Simple view degraded - target: {}, blobs: {}, failed: {}, partial: {}.",
-                        target, blobCount, failed, partial);
+                        target, blobCount, failedOutright, partial);
             } else {
                 log.info("Simple view complete - target: {}, blobs: {}.", target, blobCount);
             }
         }
     }
 
-    // ============================================================ status helpers
+    // ---------------------------------------------------------------- status helpers
 
     private void markFailed(TranslateSimpleRequest request, TranslationException ex) {
         TranslationErrorCode code = ex.getErrorCode();
-        apply(request, MessageTranslationStatus.FAILED_UPSTREAM,
+        recordStatus(request, MessageTranslationStatus.FAILED_UPSTREAM,
                 "Translation temporarily unavailable"
                         + (code == null ? "" : " (" + code.name() + ")") + "; original retained.");
-        log.error("Simple view blob failed on its first hop; original retained.", ex);
+        log.error("Blob failed on its first source language; original retained.", ex);
     }
 
-    /** Single write point for blob status. Every exit path goes through here. */
-    private void apply(TranslateSimpleRequest request, MessageTranslationStatus status, String reason) {
+    /** Single write point for blob status; every path out of this class goes through here. */
+    private void recordStatus(TranslateSimpleRequest request, MessageTranslationStatus status,
+                              String reason) {
         request.setTranslationStatus(status);
         request.setTranslationNote(reason);
     }
