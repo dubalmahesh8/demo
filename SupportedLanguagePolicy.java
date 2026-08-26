@@ -12,24 +12,26 @@ import org.springframework.stereotype.Component;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Answers "can Systran translate {@code source -> target}?" without hitting the network
- * on every call.
+ * Resolves a caller-supplied language code to the code Systran will actually accept.
  *
- * <p>Before this class, {@code supportedSourceLanguages(target)} called
- * {@code GET /v1/supportedLanguages} once per formatted-view request and once per blob in
- * the simple view — an extra round-trip (and an extra failure mode) in front of every
- * translation. The pair list changes on Systran release cadence, not per request, so a
- * TTL cache is safe.
+ * <p>Systran publishes its pairs as plain ISO codes ({@code en}, {@code ja}, {@code zh}),
+ * but the UI sends BCP-47 tags such as {@code zh-Hans} or {@code pt-BR}. Answering a plain
+ * "is this supported?" is not enough: matching on the base code and then sending the caller's
+ * original tag gets a 406, because the pre-check and the outbound call disagree about which
+ * string is in play.
  *
- * <p>If a refresh fails but we still hold a previously-loaded snapshot, we serve the stale
- * one rather than failing the batch. Only a cold-start failure propagates.
+ * <p>{@link #resolveSource} therefore returns the <em>publishable</em> code, and callers must
+ * send exactly what it hands back. The snapshot stores only what Systran published — nothing
+ * is silently widened — and the base-code fallback happens at lookup time where the result is
+ * a concrete code rather than a boolean.
  */
 @Slf4j
 @Component
@@ -49,22 +51,39 @@ public class SupportedLanguagePolicy {
         }
     }
 
-    /**
-     * Sources Systran accepts for the given target. Normalized, and containing both the
-     * full code and its base form so BCP-47 inputs match base-level pairs.
-     */
+    /** Exactly the source codes Systran published for this target. Not widened. */
     public Set<String> sourcesFor(String target) {
         return snapshot().sourcesByTarget()
                 .getOrDefault(LanguageCodes.normalize(target), Collections.emptySet());
     }
 
-    public boolean supports(String source, String target) {
-        if (LanguageCodes.isAuto(source)) {
-            return true; // let Systran detect; a genuine mismatch comes back as 406
-        }
-        Set<String> supported = sourcesFor(target);
+    /**
+     * The code to send to Systran for this source, or empty if the pair is unsupported.
+     *
+     * <p>{@code resolveSource("zh-Hans", "en")} returns {@code "zh"} when Systran publishes
+     * {@code zh -> en}. Send the returned value, never the argument.
+     */
+    public Optional<String> resolveSource(String source, String target) {
         String normalized = LanguageCodes.normalize(source);
-        return supported.contains(normalized) || supported.contains(LanguageCodes.base(normalized));
+        if (LanguageCodes.isAuto(normalized)) {
+            // Always allowed through; if Systran has no auto pair for this target it answers 406,
+            // which the gateway turns into a SourceRejected outcome.
+            return Optional.of(LanguageCodes.AUTO);
+        }
+
+        Set<String> published = sourcesFor(target);
+        if (published.contains(normalized)) {
+            return Optional.of(normalized);
+        }
+
+        // BCP-47 tag against a base-code pair list: zh-Hans -> zh, pt-BR -> pt.
+        String base = LanguageCodes.base(normalized);
+        if (published.contains(base)) {
+            log.debug("Resolved source '{}' to Systran code '{}' for target '{}'.",
+                    normalized, base, target);
+            return Optional.of(base);
+        }
+        return Optional.empty();
     }
 
     private Snapshot snapshot() {
@@ -91,14 +110,15 @@ public class SupportedLanguagePolicy {
         SystranSupportedLanguagesResponse response = systranClient.supportedLanguages();
         Map<String, Set<String>> byTarget = new LinkedHashMap<>();
 
-        if (response != null && response.getLanguagePairs() != null) {
-            response.getLanguagePairs().forEach(pair -> {
-                String target = LanguageCodes.normalize(pair.getTarget());
-                String source = LanguageCodes.normalize(pair.getSource());
-                Set<String> sources = byTarget.computeIfAbsent(target, k -> new HashSet<>());
-                sources.add(source);
-                sources.add(LanguageCodes.base(source));
-            });
+        // Systran wraps the list in "body", exactly like the textTranslation response.
+        if (response != null
+                && response.getBody() != null
+                && response.getBody().getLanguagePairs() != null) {
+
+            response.getBody().getLanguagePairs().forEach(pair ->
+                    byTarget.computeIfAbsent(LanguageCodes.normalize(pair.getTarget()),
+                                    k -> new LinkedHashSet<>())
+                            .add(LanguageCodes.normalize(pair.getSource())));
         }
 
         if (byTarget.isEmpty()) {

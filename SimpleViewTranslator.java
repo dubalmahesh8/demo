@@ -16,25 +16,27 @@ import org.springframework.stereotype.Component;
 import org.springframework.util.CollectionUtils;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 
 /**
  * Simple View: each request carries one payload blob that may contain several languages,
  * so the blob is chained sequentially through each detected source language.
  *
- * <h2>Behaviour changes vs. the original</h2>
+ * <p>Each detected language is resolved to the code Systran published before it is sent, and
+ * the chain is de-duplicated <em>on the resolved code</em> — so {@code ["zh-Hans", "zh"]}
+ * produces one hop rather than two identical ones. {@code notSupportedLanguages} still reports
+ * the caller's original codes so they can correlate against what they sent.
+ *
+ * <h2>Behaviour notes</h2>
  * <ul>
- *   <li><b>A 406 mid-chain no longer aborts the blob.</b> Previously a rejection on the
- *       second of three languages discarded the first hop's work and returned the untouched
- *       original. Now that language is recorded in {@code notSupportedLanguages} and the
- *       chain continues.</li>
- *   <li><b>A transient failure mid-chain reverts to the original text</b> and marks the blob
- *       FAILED_UPSTREAM, so each blob is all-or-nothing and a retry is clean. To keep partial
- *       progress instead, move the {@code setMessage} in {@link #chain} to run after every
- *       successful hop rather than once at the end.</li>
- *   <li><b>The supported-pair lookup no longer runs per blob.</b> It is served from
- *       {@link SupportedLanguagePolicy}'s cache.</li>
+ *   <li>A 406 mid-chain records that language and continues; it does not abort the blob.</li>
+ *   <li>A transient failure mid-chain reverts the blob to its original text and marks it
+ *       FAILED_UPSTREAM — all-or-nothing per blob. To keep partial progress instead, move the
+ *       {@code setMessage} in {@link #chain} to run after every successful hop.</li>
  * </ul>
  */
 @Slf4j
@@ -55,7 +57,7 @@ public class SimpleViewTranslator {
         for (TranslateSimpleRequest request : requests) {
             Plan plan = plan(request, normalizedTarget);
 
-            if (plan.sources().isEmpty()) {
+            if (plan.hops().isEmpty()) {
                 if (!plan.unsupported().isEmpty()) {
                     request.setNotSupportedLanguages(plan.unsupported());
                 }
@@ -86,7 +88,11 @@ public class SimpleViewTranslator {
 
     // ---------------------------------------------------------------- planning
 
-    private record Plan(List<String> sources,
+    /** One chain step: the code Systran gets, and the code the caller gave us. */
+    private record Hop(String systranCode, String declaredCode) {
+    }
+
+    private record Plan(List<Hop> hops,
                         List<String> unsupported,
                         boolean usedAuto,
                         MessageTranslationStatus terminalStatus,
@@ -100,12 +106,11 @@ public class SimpleViewTranslator {
             return new Plan(List.of(), unsupported, false, status, reason);
         }
 
-        static Plan of(List<String> sources, List<String> unsupported, boolean usedAuto) {
-            return new Plan(sources, unsupported, usedAuto, null, null);
+        static Plan of(List<Hop> hops, List<String> unsupported, boolean usedAuto) {
+            return new Plan(hops, unsupported, usedAuto, null, null);
         }
     }
 
-    /** Decides which source languages this blob should be chained through, if any. */
     private Plan plan(TranslateSimpleRequest request, String target) {
         if (StringUtils.isBlank(request.getMessage())
                 || !hasTranslatableContent(request.getMessage())) {
@@ -115,39 +120,41 @@ public class SimpleViewTranslator {
 
         if (CollectionUtils.isEmpty(request.getDetectedLanguages())) {
             // No hint from the caller - let Systran detect.
-            return Plan.of(List.of(LanguageCodes.AUTO), List.of(), true);
+            return Plan.of(List.of(new Hop(LanguageCodes.AUTO, LanguageCodes.AUTO)), List.of(), true);
         }
 
-        List<String> sources = new ArrayList<>();
+        // Keyed by resolved code so zh-Hans and zh collapse to a single hop.
+        Map<String, Hop> hops = new LinkedHashMap<>();
         List<String> unsupported = new ArrayList<>();
         boolean sawTargetLanguage = false;
 
-        // LinkedHashSet preserves caller order while removing duplicates.
         for (String raw : new LinkedHashSet<>(request.getDetectedLanguages())) {
             if (StringUtils.isBlank(raw)) {
                 continue;
             }
-            String lang = LanguageCodes.normalize(raw);
+            String declared = LanguageCodes.normalize(raw);
 
-            if (LanguageCodes.sameLanguage(lang, target)) {
+            if (LanguageCodes.sameLanguage(declared, target)) {
                 sawTargetLanguage = true;
                 continue;
             }
-            if (supportedLanguagePolicy.supports(lang, target)) {
-                sources.add(lang);
-            } else {
-                unsupported.add(lang);
+
+            Optional<String> resolved = supportedLanguagePolicy.resolveSource(declared, target);
+            if (resolved.isEmpty()) {
+                unsupported.add(declared);
                 log.info("Skipping unsupported source '{}' -> target '{}' (original retained).",
-                        lang, target);
+                        declared, target);
+                continue;
             }
+            hops.putIfAbsent(resolved.get(), new Hop(resolved.get(), declared));
         }
 
-        if (!sources.isEmpty()) {
-            return Plan.of(sources, unsupported, false);
+        if (!hops.isEmpty()) {
+            return Plan.of(List.copyOf(hops.values()), unsupported, false);
         }
 
-        // Nothing left to translate. Distinguish why, so the caller knows whether the
-        // content was already fine or genuinely could not be handled.
+        // Nothing left to translate. Distinguish why, so the caller knows whether the content
+        // was already fine or genuinely could not be handled.
         if (!unsupported.isEmpty()) {
             return Plan.skip(MessageTranslationStatus.SKIPPED_UNSUPPORTED_SOURCE,
                     "No detected source language is supported for target '" + target + "'.",
@@ -170,23 +177,23 @@ public class SimpleViewTranslator {
     // ---------------------------------------------------------------- chaining
 
     /**
-     * Runs the blob through each source language in turn, feeding each result into the next
-     * call. The request is only mutated once the whole chain has settled, which is what makes
-     * a transient failure leave the original intact.
+     * Runs the blob through each hop in turn, feeding each result into the next call. The
+     * request is only mutated once the whole chain has settled, which is what makes a
+     * transient failure leave the original intact.
      */
     private void chain(TranslateSimpleRequest request, Plan plan, String target) {
         String text = request.getMessage();
         List<String> unsupported = new ArrayList<>(plan.unsupported());
         SystranOutcome.Translated lastTranslated = null;
 
-        for (String source : plan.sources()) {
-            SystranOutcome outcome = systranGateway.translate(text, source, target);
+        for (Hop hop : plan.hops()) {
+            SystranOutcome outcome = systranGateway.translate(text, hop.systranCode(), target);
 
             if (outcome instanceof SystranOutcome.SourceRejected rejected) {
                 // Systran advertised this pair but declined it. Record and keep going -
                 // the other languages in this blob may still translate.
                 log.info("{} Continuing with remaining source(s).", rejected.detail());
-                unsupported.add(source);
+                unsupported.add(hop.declaredCode());
                 continue;
             }
 

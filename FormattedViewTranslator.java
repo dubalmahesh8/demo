@@ -19,29 +19,20 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * Formatted View: groups messages by source language and translates each group in one
  * batched Systran call.
  *
- * <p>A straight three-phase pipeline - classify, group, translate. The original interleaved
- * all three and addressed messages by {@code List<Integer>} index; grouping the objects
- * themselves removes every {@code messages.get(i)} lookup.
+ * <p>Groups are keyed by the <em>resolved</em> Systran code, not the caller's code. So
+ * {@code zh-Hans} and {@code zh} land in the same group and produce one call, and the string
+ * sent to Systran is always one it published. The message keeps its original
+ * {@code detectedLanguage} — we translate on the caller's behalf, we don't correct their data.
  *
- * <p>Systran accepts ~50MB per call, so a language group is sent as a single call regardless
- * of size. The one case that still splits a group is a message body that already contains
- * the segment delimiter - batching that would desynchronise the response split, so it is
- * sent on its own.
- *
- * <h2>Outcome contract</h2>
- * <ul>
- *   <li>Permanent, message-level outcomes (INFO, no content, already target, unsupported
- *       pair, 406) mark the message and return 200.</li>
- *   <li>Transient failures (5xx, timeout, segment mismatch) mark the group FAILED_UPSTREAM
- *       and return 200 <em>as long as some other group succeeded</em>.</li>
- *   <li>If every group that was actually attempted failed, the exception propagates so the
- *       caller gets 502/504 rather than a 200 that silently contains nothing but originals.</li>
- * </ul>
+ * <p>Systran accepts ~50MB per call, so a group is sent as a single call regardless of size.
+ * The one case that still splits a group is a message body containing the segment delimiter,
+ * which would desynchronise the response split.
  */
 @Slf4j
 @Component
@@ -64,22 +55,16 @@ public class FormattedViewTranslator {
         TranslationException lastFailure = null;
 
         for (Map.Entry<String, List<TranslateMessageRequest>> entry : groups.entrySet()) {
-            String sourceLang = entry.getKey();
+            String systranSource = entry.getKey();
             List<TranslateMessageRequest> group = entry.getValue();
-
-            if (!supportedLanguagePolicy.supports(sourceLang, normalizedTarget)) {
-                // Pre-check: skip the Systran call entirely for unsupported source languages.
-                markUnsupported(group, sourceLang, normalizedTarget);
-                continue;
-            }
 
             attempted++;
             try {
-                translateGroup(group, sourceLang, normalizedTarget);
+                translateGroup(group, systranSource, normalizedTarget);
             } catch (TranslationException ex) {
                 failed++;
                 lastFailure = ex;
-                markFailed(group, sourceLang, normalizedTarget, ex);
+                markFailed(group, systranSource, normalizedTarget, ex);
             }
         }
 
@@ -99,8 +84,9 @@ public class FormattedViewTranslator {
     // ---------------------------------------------------------------- phase 1: classify
 
     /**
-     * Assigns a terminal status to every message that will not be sent to Systran, and
-     * returns the remainder grouped by normalized source language.
+     * Assigns a terminal status to every message that will not be sent to Systran, and returns
+     * the remainder grouped by the resolved Systran source code. The unsupported-pair pre-check
+     * lives here because resolution and support are now the same question.
      */
     private Map<String, List<TranslateMessageRequest>> classifyAndGroup(
             List<TranslateMessageRequest> messages, String target) {
@@ -118,15 +104,25 @@ public class FormattedViewTranslator {
                 continue;
             }
 
-            String sourceLang = LanguageCodes.normalize(message.getDetectedLanguage());
+            String declared = LanguageCodes.normalize(message.getDetectedLanguage());
 
-            if (!LanguageCodes.isAuto(sourceLang) && LanguageCodes.sameLanguage(sourceLang, target)) {
+            if (!LanguageCodes.isAuto(declared) && LanguageCodes.sameLanguage(declared, target)) {
                 apply(message, MessageTranslationStatus.SKIPPED_ALREADY_TARGET_LANGUAGE,
                         "Message is already in the target language.");
                 continue;
             }
 
-            groups.computeIfAbsent(sourceLang, k -> new ArrayList<>()).add(message);
+            // Pre-check and code resolution in one step: skip the Systran call entirely for
+            // unsupported sources, and for supported ones learn the exact code to send.
+            Optional<String> systranSource = supportedLanguagePolicy.resolveSource(declared, target);
+            if (systranSource.isEmpty()) {
+                apply(message, MessageTranslationStatus.SKIPPED_UNSUPPORTED_SOURCE,
+                        String.format("Source language '%s' is not supported for target '%s'.",
+                                declared, target));
+                continue;
+            }
+
+            groups.computeIfAbsent(systranSource.get(), k -> new ArrayList<>()).add(message);
         }
         return groups;
     }
@@ -141,17 +137,18 @@ public class FormattedViewTranslator {
 
     // ---------------------------------------------------------------- phase 2: translate
 
-    private void translateGroup(List<TranslateMessageRequest> group, String sourceLang, String target) {
+    private void translateGroup(List<TranslateMessageRequest> group, String systranSource, String target) {
         for (List<TranslateMessageRequest> batch : splitDelimiterUnsafe(group)) {
             List<String> bodies = batch.stream()
                     .map(message -> StringUtils.defaultString(message.getHtml()))
                     .toList();
 
-            SystranOutcome outcome = systranGateway.translate(segmentCodec.join(bodies), sourceLang, target);
+            SystranOutcome outcome =
+                    systranGateway.translate(segmentCodec.join(bodies), systranSource, target);
 
             if (outcome instanceof SystranOutcome.SourceRejected rejected) {
                 log.info("{} Original retained for {} message(s).", rejected.detail(), batch.size());
-                markUnsupported(batch, sourceLang, target);
+                markUnsupported(batch, systranSource, target);
                 continue;
             }
 
@@ -169,7 +166,7 @@ public class FormattedViewTranslator {
 
     /**
      * Isolates any message whose body already contains the segment delimiter. Everything else
-     * goes in a single batch - Systran's input ceiling is high enough that size never forces
+     * goes in a single batch — Systran's input ceiling is high enough that size never forces
      * a split.
      */
     private List<List<TranslateMessageRequest>> splitDelimiterUnsafe(List<TranslateMessageRequest> group) {
@@ -192,23 +189,23 @@ public class FormattedViewTranslator {
 
     // ---------------------------------------------------------------- status helpers
 
-    private void markUnsupported(List<TranslateMessageRequest> group, String sourceLang, String target) {
-        String reason = String.format("Source language '%s' is not supported for target '%s'.",
-                sourceLang, target);
-        group.forEach(message ->
-                apply(message, MessageTranslationStatus.SKIPPED_UNSUPPORTED_SOURCE, reason));
-        log.info("Skipping {} message(s) - unsupported source '{}' -> target '{}'.",
-                group.size(), sourceLang, target);
+    private void markUnsupported(List<TranslateMessageRequest> group, String systranSource, String target) {
+        group.forEach(message -> apply(message, MessageTranslationStatus.SKIPPED_UNSUPPORTED_SOURCE,
+                String.format("Source language '%s' is not supported for target '%s'.",
+                        // Report the caller's own code, not the resolved one - they can correlate it.
+                        StringUtils.defaultIfBlank(message.getDetectedLanguage(), systranSource), target)));
+        log.info("Skipping {} message(s) - Systran rejected source '{}' -> target '{}'.",
+                group.size(), systranSource, target);
     }
 
-    private void markFailed(List<TranslateMessageRequest> group, String sourceLang, String target,
+    private void markFailed(List<TranslateMessageRequest> group, String systranSource, String target,
                             TranslationException ex) {
         TranslationErrorCode code = ex.getErrorCode();
         String reason = "Translation temporarily unavailable"
                 + (code == null ? "" : " (" + code.name() + ")") + "; original retained.";
         group.forEach(message -> apply(message, MessageTranslationStatus.FAILED_UPSTREAM, reason));
         log.error("Group '{}' -> '{}' failed for {} message(s).",
-                sourceLang, target, group.size(), ex);
+                systranSource, target, group.size(), ex);
     }
 
     private void apply(TranslateMessageRequest message, MessageTranslationStatus status, String reason) {
