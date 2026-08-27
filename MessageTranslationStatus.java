@@ -1,54 +1,47 @@
 package com.citi.uno.items.translation.dto;
 
 /**
- * Per-message outcome. Replaces the {@code boolean translated} + free-text reason pair,
- * which forced callers to string-match on {@code translationSkippedReason}.
+ * Per-item outcome. Replaces the {@code boolean translated} + free-text reason pair, which
+ * forced callers to string-match on the reason to tell one outcome from another.
  *
- * <p>The critical distinction is {@link #isRetryable()}: a caller that persists or caches
- * our output must not treat FAILED_UPSTREAM the same as SKIPPED_UNSUPPORTED_SOURCE.
- * The first will succeed on retry; the second never will.
+ * <p>{@link #isTranslated()} backs the derived {@code translated} field on both view DTOs.
+ * Everything else that matters is the constant itself: the note text and any UI treatment
+ * branch on the status, not on a helper flag.
  */
 public enum MessageTranslationStatus {
 
-    /** Systran returned a translation and it was written back to the message. */
-    TRANSLATED(true, false),
-
-    /** subType = INFO. Never translated by design. */
-    SKIPPED_INFO_MESSAGE(false, false),
-
-    /** html was blank, or contained no letters after tag stripping. */
-    SKIPPED_NO_TRANSLATABLE_CONTENT(false, false),
-
-    /** detectedLanguage already equals the requested target. */
-    SKIPPED_ALREADY_TARGET_LANGUAGE(false, false),
-
-    /** Systran does not offer this source -> target pair (pre-check, or a 406 at call time). */
-    SKIPPED_UNSUPPORTED_SOURCE(false, false),
+    /** Systran returned a translation and it was written back. */
+    TRANSLATED(true),
 
     /**
-     * Simple view only. Some source languages were translated and others failed upstream, so the
-     * text is translated but not fully. Both translated and retryable: the caller has usable
-     * content now, and a retry would complete it.
+     * Simple view only. Some source languages were translated and others failed upstream, so
+     * the text is translated but not fully.
      */
-    PARTIALLY_TRANSLATED(true, true),
+    PARTIALLY_TRANSLATED(true),
 
-    /** Systran was reachable-but-broken, timed out, or returned a malformed batch. Retry may succeed. */
-    FAILED_UPSTREAM(false, true);
+    /** subType = INFO. Never translated by design. */
+    SKIPPED_INFO_MESSAGE(false),
+
+    /** Body was blank, or contained no letters after tag stripping. */
+    SKIPPED_NO_TRANSLATABLE_CONTENT(false),
+
+    /** Source already equals the requested target. */
+    SKIPPED_ALREADY_TARGET_LANGUAGE(false),
+
+    /** Systran does not offer this source -> target pair, by pre-check or by 406 at call time. */
+    SKIPPED_UNSUPPORTED_SOURCE(false),
+
+    /** Systran was reachable-but-broken, timed out, or returned a malformed batch. */
+    FAILED_UPSTREAM(false);
 
     private final boolean translated;
-    private final boolean retryable;
 
-    MessageTranslationStatus(boolean translated, boolean retryable) {
+    MessageTranslationStatus(boolean translated) {
         this.translated = translated;
-        this.retryable = retryable;
     }
 
     /** Backing value for the legacy {@code translated} flag, kept for wire compatibility. */
     public boolean isTranslated() {
         return translated;
-    }
-
-    public boolean isRetryable() {
-        return retryable;
     }
 }

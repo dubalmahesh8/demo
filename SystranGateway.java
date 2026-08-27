@@ -9,15 +9,16 @@ import feign.RetryableException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 /**
  * The single place that knows how Systran fails.
  *
- * <p>Everything above this class deals in {@link SystranOutcome} and
- * {@link TranslationException}; nothing above it touches Feign types or raw HTTP status
- * codes. That keeps the retryable/permanent classification in one place instead of
- * scattered across two views.
+ * <p>Everything above this class deals in {@link SystranOutcome} and {@link TranslationException};
+ * nothing above it touches Feign types or raw HTTP status codes. A 406 comes back as a value
+ * because it is a routine answer ("I don't do that language pair"), while anything that a retry
+ * might fix is thrown.
  */
 @Slf4j
 @Component
@@ -26,13 +27,29 @@ public class SystranGateway {
 
     private final SystranClient systranClient;
 
+    @Value("${systran.api.slow-call-threshold-ms:5000}")
+    private long slowCallThresholdMs;
+
     public SystranOutcome translate(String text, String source, String target) {
+        long startedAt = System.nanoTime();
         try {
-            SystranTranslationResponse response = systranClient.translate(buildRequest(text, source, target));
-            return interpret(response, source, target);
+            SystranOutcome outcome = call(text, source, target);
+            logCall(source, target, text, startedAt, describe(outcome));
+            return outcome;
+
+        } catch (TranslationException ex) {
+            logCall(source, target, text, startedAt, ex.getErrorCode().name());
+            throw ex;
+        }
+    }
+
+    /** Everything that can go wrong with one call, mapped to our own vocabulary. */
+    private SystranOutcome call(String text, String source, String target) {
+        try {
+            return interpret(systranClient.translate(buildRequest(text, source, target)), source, target);
 
         } catch (FeignException.NotAcceptable ex) {
-            // Systran advertised this pair but rejects it at call time.
+            // Systran advertised this pair but declines it at call time. Routine, not a failure.
             return new SystranOutcome.SourceRejected(
                     "Systran rejected source '" + source + "' for target '" + target + "' (406).");
 
@@ -53,25 +70,23 @@ public class SystranGateway {
                     "Systran returned an empty body for " + source + " -> " + target + ".");
         }
 
-        // Systran can return HTTP 200 with status="error" and the detail in body.message.
+        // Systran can answer HTTP 200 with status="error" and the detail in body.message.
         if ("error".equalsIgnoreCase(response.getStatus())) {
-            // Deliberately not echoed to the client - upstream error text is not ours to leak.
+            // Truncated, and never echoed to the caller - Systran may quote submitted text back.
             log.warn("Systran reported an error for {} -> {}: {}", source, target,
-                    response.getBody().getMessage());
+                    StringUtils.abbreviate(response.getBody().getMessage(), 200));
             throw new TranslationException(TranslationErrorCode.SYSTRAN_API_ERROR,
                     "Systran could not complete the translation.");
         }
 
-        String detected = StringUtils.defaultIfBlank(
-                response.getBody().getDetectedSource(),
+        String detected = StringUtils.defaultIfBlank(response.getBody().getDetectedSource(),
                 StringUtils.defaultIfBlank(response.getBody().getSource(), source));
 
         return new SystranOutcome.Translated(stripSystranMeta(response.getBody().getText()), detected);
     }
 
     private SystranTranslationRequest buildRequest(String text, String source, String target) {
-        // TODO(mahesh): confirm against SystranTranslationRequest's actual field names -
-        // I could not read them in the screenshots. Adjust setters if they differ.
+        // TODO(mahesh): confirm against SystranTranslationRequest's actual field names.
         SystranTranslationRequest request = new SystranTranslationRequest();
         request.setInput(text);
         request.setSource(source);
@@ -81,11 +96,29 @@ public class SystranGateway {
 
     /**
      * TODO(mahesh): move the body of the existing private stripSystranMeta(String) from
-     * TranslationService into here verbatim. Doing the strip at the boundary means no
-     * caller ever sees un-cleaned Systran text, and the method stops being duplicated
-     * across the batched and single-blob paths.
+     * TranslationService into here verbatim. Stripping at the boundary means no caller ever
+     * sees un-cleaned Systran text.
      */
     private String stripSystranMeta(String text) {
         return text;
+    }
+
+    // ---------------------------------------------------------------- logging
+
+    private String describe(SystranOutcome outcome) {
+        return outcome instanceof SystranOutcome.SourceRejected ? "rejected-406" : "ok";
+    }
+
+    /** Never logs the payload - these bodies are customer chat and email content. */
+    private void logCall(String source, String target, String text, long startedAt, String result) {
+        long ms = (System.nanoTime() - startedAt) / 1_000_000;
+        int chars = StringUtils.length(text);
+        if (ms > slowCallThresholdMs) {
+            log.warn("Systran call slow - {} -> {}, chars: {}, result: {}, {} ms",
+                    source, target, chars, result, ms);
+        } else {
+            log.info("Systran call - {} -> {}, chars: {}, result: {}, {} ms",
+                    source, target, chars, result, ms);
+        }
     }
 }

@@ -5,7 +5,6 @@ import com.citi.uno.items.translation.dto.TranslateSimpleRequest;
 import com.citi.uno.items.translation.exception.TranslationErrorCode;
 import com.citi.uno.items.translation.exception.TranslationException;
 import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.util.CollectionUtils;
@@ -34,7 +33,6 @@ import java.util.List;
  * {@link TranslationException} propagate to {@code InputValidationExceptionHandler} (which
  * maps it to 502 / 503 / 504 via {@link TranslationErrorCode}) when nothing did.
  */
-@Slf4j
 @Service
 @RequiredArgsConstructor
 public class TranslationService {
@@ -52,7 +50,6 @@ public class TranslationService {
             return messages;
         }
         assertEnabled();
-        log.info("translateFormattedView - messages: {}, target: {}", messages.size(), target);
         return formattedViewTranslator.translate(messages, target);
     }
 
@@ -63,7 +60,6 @@ public class TranslationService {
             return requests;
         }
         assertEnabled();
-        log.info("translateSimpleView - blobs: {}, target: {}", requests.size(), target);
         return simpleViewTranslator.translate(requests, target);
     }
 
