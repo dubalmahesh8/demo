@@ -7,7 +7,7 @@ import com.citi.uno.items.translation.dto.TranslateMessageRequest;
 import com.citi.uno.items.translation.exception.TranslationException;
 import com.citi.uno.items.translation.service.support.LanguageCodes;
 import com.citi.uno.items.translation.service.support.RequestSummary;
-import com.citi.uno.items.translation.service.support.SegmentCodec;
+import com.citi.uno.items.translation.service.support.MessageBatcher;
 import com.citi.uno.items.translation.service.support.SupportedLanguagePolicy;
 import com.citi.uno.items.translation.service.support.TranslationOutcomes;
 import lombok.RequiredArgsConstructor;
@@ -36,7 +36,7 @@ public class FormattedViewTranslator {
     private static final String INFO = "INFO";
 
     private final SupportedLanguagePolicy supportedLanguagePolicy;
-    private final SegmentCodec segmentCodec;
+    private final MessageBatcher messageBatcher;
     private final SystranGateway systranGateway;
 
     public List<TranslateMessageRequest> translate(List<TranslateMessageRequest> messages, String target) {
@@ -140,7 +140,7 @@ public class FormattedViewTranslator {
                     .toList();
 
             SystranOutcome outcome =
-                    systranGateway.translate(segmentCodec.join(bodies), systranCode, target);
+                    systranGateway.translate(messageBatcher.pack(bodies), systranCode, target);
 
             if (outcome instanceof SystranOutcome.SourceRejected rejected) {
                 log.info("{} Original retained for {} message(s).", rejected.detail(), batch.size());
@@ -151,7 +151,7 @@ public class FormattedViewTranslator {
 
             // split throws on a count mismatch rather than risk writing one message's text into another.
             String translatedText = ((SystranOutcome.Translated) outcome).text();
-            List<String> parts = segmentCodec.split(translatedText, batch.size());
+            List<String> parts = messageBatcher.unpack(translatedText, batch.size());
 
             for (int i = 0; i < batch.size(); i++) {
                 batch.get(i).setHtml(parts.get(i));
@@ -170,7 +170,7 @@ public class FormattedViewTranslator {
         List<TranslateMessageRequest> batchable = new ArrayList<>();
 
         for (TranslateMessageRequest message : group) {
-            if (segmentCodec.isSafeToBatch(message.getHtml())) {
+            if (messageBatcher.isSafeToBatch(message.getHtml())) {
                 batchable.add(message);
             } else {
                 log.warn("Message body contains the segment delimiter; sending it as its own call.");
